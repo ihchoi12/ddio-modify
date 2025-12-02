@@ -1,2 +1,6 @@
+# Build directories
+build/
 cmake-build-debug/
+
+# IDE
 .idea/

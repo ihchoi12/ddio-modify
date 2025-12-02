@@ -38,16 +38,81 @@ void init_pci_access(void) {
     pci_scan_bus(pacc); /* We want to get the list of devices */
 }
 
+static int search_count = 0;
+
 struct pci_dev *
-find_ddio_device(uint8_t nic_bus) {
+find_ddio_device(uint8_t nic_bus, int verbose) {
     struct pci_dev *dev;
+    char namebuf[1024];
+
+    search_count++;
+
+    if (verbose) {
+        printf("\n[SEARCH #%d] Looking for device on bus 0x%02x (searching for xx:00.0)...\n",
+               search_count, nic_bus);
+    }
+
     for (dev = pacc->devices; dev; dev = dev->next) {
-        pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_NUMA_NODE | PCI_FILL_PHYS_SLOT);
+        pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_NUMA_NODE | PCI_FILL_PHYS_SLOT | PCI_FILL_CLASS);
+
+        // Log all devices on this bus for debugging
+        if (verbose && dev->bus == nic_bus) {
+            const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
+                                                      PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
+            printf("[DEBUG] Found device: %02x:%02x.%x - Class: 0x%04x - %s\n",
+                   dev->bus, dev->dev, dev->func, dev->device_class, device_name);
+        }
+
         if (dev->func == 0 && dev->dev == 0 && dev->bus == nic_bus) {
+            if (verbose) {
+                const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
+                                                          PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
+                printf("\n[FOUND] Selected device: %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+                printf("        Device Class: 0x%04x", dev->device_class);
+
+                // Decode device class
+                uint16_t class_code = dev->device_class >> 8;
+                if (class_code == 0x02) {
+                    printf(" (Network Controller)\n");
+                } else if (class_code == 0x06) {
+                    uint16_t subclass = dev->device_class & 0xFF;
+                    if (subclass == 0x04) {
+                        printf(" (PCI Bridge/Root Port)\n");
+                    } else {
+                        printf(" (PCI Bridge - subclass 0x%02x)\n", subclass);
+                    }
+                } else if (class_code == 0x08) {
+                    printf(" (System Peripheral - IOMMU/VT-d)\n");
+                } else {
+                    printf(" (Class 0x%02x)\n", class_code);
+                }
+
+                printf("        Device Name: %s\n", device_name);
+
+                // Check if this is actually a PCIe Root Port (class 0x06, subclass 0x04)
+                uint16_t subclass = dev->device_class & 0xFF;
+                if (class_code == 0x06 && subclass == 0x04) {
+                    printf("        ✓ CORRECT: This is a PCI Bridge/Root Port\n");
+                    printf("        ✓ DDIO register should be here!\n");
+                } else if (class_code == 0x08) {
+                    printf("        ✗ WRONG: This is a System Peripheral (IOMMU/VT-d)\n");
+                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
+                    printf("        ✗ This is NOT a PCIe Root Port!\n");
+                } else if (class_code == 0x02) {
+                    printf("        ✗ WRONG: This is the NIC itself (Network Controller)\n");
+                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
+                    printf("        ✗ DDIO register is NOT in the NIC!\n");
+                    printf("        ✗ Should search parent bus (0x%02x) instead!\n", dev->bus - 1);
+                } else {
+                    printf("        ✗ WRONG: Unexpected device class 0x%02x/0x%02x\n", class_code, subclass);
+                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
+                }
+            }
+
             return dev;
         }
     }
-    printf("Could not find the proper PCIe root!\n");
+    printf("\n[ERROR] Could not find device at bus %02x:00.0\n", nic_bus);
     return NULL;
 }
 
@@ -65,7 +130,7 @@ int ddio_status(uint8_t nic_bus) {
     if (!pacc)
         init_pci_access();
 
-    struct pci_dev *dev = find_ddio_device(nic_bus);
+    struct pci_dev *dev = find_ddio_device(nic_bus, 0);  // quiet mode
     if (!dev) {
         printf("No device found!\n");
         exit(1);
@@ -81,38 +146,68 @@ int ddio_status(uint8_t nic_bus) {
 }
 
 void ddio_enable(uint8_t nic_bus) {
-    uint32_t val;
+    uint32_t val, val_after;
     if (!pacc)
         init_pci_access();
 
     if (!ddio_status(nic_bus)) {
-        struct pci_dev *dev = find_ddio_device(nic_bus);
+        struct pci_dev *dev = find_ddio_device(nic_bus, 0);  // quiet mode
         if (!dev) {
             printf("No device found!\n");
             exit(1);
         }
+
+        printf("\n[ENABLE] Attempting to enable DDIO...\n");
         val = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+        printf("[ENABLE] Register 0x180 BEFORE write: 0x%08x\n", val);
+        printf("[ENABLE]   - bit 7 (DDIO): %s\n", (val & 0x80) ? "ON" : "OFF");
+
         pci_write_long(dev, SKX_PERFCTRLSTS_0, val | SKX_use_allocating_flow_wr_MASK);
-        printf("DDIO is enabled!\n");
+
+        val_after = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+        printf("[ENABLE] Register 0x180 AFTER write:  0x%08x\n", val_after);
+        printf("[ENABLE]   - bit 7 (DDIO): %s\n", (val_after & 0x80) ? "ON" : "OFF");
+
+        if ((val_after & 0x80) == 0) {
+            printf("[ENABLE] ✗ FAILED: Register write did not take effect!\n");
+            printf("[ENABLE]    This likely means we're writing to the wrong device.\n");
+        } else {
+            printf("[ENABLE] ✓ SUCCESS: DDIO is now enabled!\n");
+        }
     } else {
         printf("DDIO was already enabled!\n");
     }
 }
 
 void ddio_disable(uint8_t nic_bus) {
-    uint32_t val;
+    uint32_t val, val_after;
     if (!pacc)
         init_pci_access();
 
     if (ddio_status(nic_bus)) {
-        struct pci_dev *dev = find_ddio_device(nic_bus);
+        struct pci_dev *dev = find_ddio_device(nic_bus, 0);  // quiet mode
         if (!dev) {
             printf("No device found!\n");
             exit(1);
         }
+
+        printf("\n[DISABLE] Attempting to disable DDIO...\n");
         val = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+        printf("[DISABLE] Register 0x180 BEFORE write: 0x%08x\n", val);
+        printf("[DISABLE]   - bit 7 (DDIO): %s\n", (val & 0x80) ? "ON" : "OFF");
+
         pci_write_long(dev, SKX_PERFCTRLSTS_0, val & (~SKX_use_allocating_flow_wr_MASK));
-        printf("DDIO is disabled!\n");
+
+        val_after = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+        printf("[DISABLE] Register 0x180 AFTER write:  0x%08x\n", val_after);
+        printf("[DISABLE]   - bit 7 (DDIO): %s\n", (val_after & 0x80) ? "ON" : "OFF");
+
+        if ((val_after & 0x80) != 0) {
+            printf("[DISABLE] ✗ FAILED: Register write did not take effect!\n");
+            printf("[DISABLE]    This likely means we're writing to the wrong device.\n");
+        } else {
+            printf("[DISABLE] ✓ SUCCESS: DDIO is now disabled!\n");
+        }
     } else {
         printf("DDIO was already disabled\n");
     }
@@ -148,7 +243,7 @@ int main(int argc, char *argv[]) {
 
     init_pci_access();
 
-    struct pci_dev *dev = find_ddio_device(FLAGS_nic_bus);
+    struct pci_dev *dev = find_ddio_device(FLAGS_nic_bus, 1);  // verbose mode
     print_dev_info(dev);
 
     if (FLAGS_enable) {
