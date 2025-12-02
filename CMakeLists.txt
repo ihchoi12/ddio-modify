@@ -5,4 +5,4 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_executable(ddio_modify
         ddio-modify.cpp)
-target_link_libraries(ddio_modify -lpci -lgflags)
+target_link_libraries(ddio_modify -lpci)

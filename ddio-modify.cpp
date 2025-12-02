@@ -15,7 +15,9 @@ extern "C" {
 #include <sys/types.h>
 #include <inttypes.h>
 #include <unistd.h>
-#include <gflags/gflags.h>
+#include <time.h>
+#include <limits.h>
+#include <string.h>
 
 #define PCI_VENDOR_ID_INTEL 0x8086
 #define SKX_PERFCTRLSTS_0 0x180
@@ -32,10 +34,46 @@ extern "C" {
 
 struct pci_access *pacc;
 
+// State file stored in /tmp (works across NFS mounts and different machines)
+const char *state_file_path = "/tmp/.ddio_state.dat";
+
 void init_pci_access(void) {
     pacc = pci_alloc(); /* Get the pci_access structure */
     pci_init(pacc);         /* Initialize the PCI library */
     pci_scan_bus(pacc); /* We want to get the list of devices */
+}
+
+/*
+ * Read MSR 0xc8b (LLC Ways Allocation for DDIO)
+ * Returns: 0 on success, -1 on error
+ */
+int read_msr_llc_ways(uint32_t *value) {
+    FILE *fp = popen("rdmsr -p 0 0xc8b 2>/dev/null", "r");
+    if (!fp) {
+        return -1;
+    }
+
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp)) {
+        if (sscanf(buf, "%x", value) == 1) {
+            pclose(fp);
+            return 0;
+        }
+    }
+    pclose(fp);
+    return -1;
+}
+
+/*
+ * Write MSR 0xc8b (LLC Ways Allocation for DDIO)
+ * Writes to all CPUs (-a flag)
+ * Returns: 0 on success, -1 on error
+ */
+int write_msr_llc_ways(uint32_t value) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "wrmsr -a 0xc8b 0x%x 2>/dev/null", value);
+    int ret = system(cmd);
+    return (ret == 0) ? 0 : -1;
 }
 
 static int search_count = 0;
@@ -44,38 +82,67 @@ struct pci_dev *
 find_ddio_device(uint8_t nic_bus, int verbose) {
     struct pci_dev *dev;
     char namebuf[1024];
+    uint8_t parent_bus = nic_bus - 1;
 
     search_count++;
 
     if (verbose) {
-        printf("\n[SEARCH #%d] Looking for device on bus 0x%02x (searching for xx:00.0)...\n",
+        printf("\n[SEARCH #%d] Looking for PCIe Root Port for NIC on bus 0x%02x...\n",
                search_count, nic_bus);
+        printf("[STRATEGY] Searching for PCI Bridge (class 0x0604) on parent bus 0x%02x\n",
+               parent_bus);
+    }
+
+    // STEP 1: Search for PCIe Root Port (PCI Bridge class 0x0604) on parent bus
+    for (dev = pacc->devices; dev; dev = dev->next) {
+        pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_NUMA_NODE | PCI_FILL_PHYS_SLOT | PCI_FILL_CLASS);
+
+        // Log all devices on parent bus for debugging
+        if (verbose && dev->bus == parent_bus) {
+            const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
+                                                      PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
+            printf("[DEBUG] Parent bus device: %02x:%02x.%x - Class: 0x%04x - %s\n",
+                   dev->bus, dev->dev, dev->func, dev->device_class, device_name);
+        }
+
+        // Look for PCI Bridge (class 0x0604) on parent bus
+        if (dev->bus == parent_bus && dev->device_class == 0x0604) {
+            if (verbose) {
+                const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
+                                                          PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
+                printf("\n[FOUND] ✓ PCIe Root Port: %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+                printf("        Device Class: 0x%04x (PCI Bridge/Root Port)\n", dev->device_class);
+                printf("        Device Name: %s\n", device_name);
+                printf("        ✓ CORRECT: This is a PCIe Root Port!\n");
+                printf("        ✓ DDIO register (0x180) should be accessible here!\n");
+            }
+            return dev;
+        }
+    }
+
+    // STEP 2: Fallback - try old method but with strong warnings
+    if (verbose) {
+        printf("\n[WARNING] Could not find PCI Bridge on parent bus 0x%02x\n", parent_bus);
+        printf("[WARNING] Trying fallback: searching for %02x:00.0...\n", nic_bus);
     }
 
     for (dev = pacc->devices; dev; dev = dev->next) {
         pci_fill_info(dev, PCI_FILL_IDENT | PCI_FILL_BASES | PCI_FILL_NUMA_NODE | PCI_FILL_PHYS_SLOT | PCI_FILL_CLASS);
 
-        // Log all devices on this bus for debugging
-        if (verbose && dev->bus == nic_bus) {
-            const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
-                                                      PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
-            printf("[DEBUG] Found device: %02x:%02x.%x - Class: 0x%04x - %s\n",
-                   dev->bus, dev->dev, dev->func, dev->device_class, device_name);
-        }
-
         if (dev->func == 0 && dev->dev == 0 && dev->bus == nic_bus) {
             if (verbose) {
                 const char *device_name = pci_lookup_name(pacc, namebuf, sizeof(namebuf),
                                                           PCI_LOOKUP_DEVICE, dev->vendor_id, dev->device_id);
-                printf("\n[FOUND] Selected device: %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
-                printf("        Device Class: 0x%04x", dev->device_class);
+                printf("\n[FALLBACK] Found device: %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+                printf("           Device Class: 0x%04x", dev->device_class);
 
                 // Decode device class
                 uint16_t class_code = dev->device_class >> 8;
+                uint16_t subclass = dev->device_class & 0xFF;
+
                 if (class_code == 0x02) {
                     printf(" (Network Controller)\n");
                 } else if (class_code == 0x06) {
-                    uint16_t subclass = dev->device_class & 0xFF;
                     if (subclass == 0x04) {
                         printf(" (PCI Bridge/Root Port)\n");
                     } else {
@@ -87,32 +154,31 @@ find_ddio_device(uint8_t nic_bus, int verbose) {
                     printf(" (Class 0x%02x)\n", class_code);
                 }
 
-                printf("        Device Name: %s\n", device_name);
+                printf("           Device Name: %s\n", device_name);
 
-                // Check if this is actually a PCIe Root Port (class 0x06, subclass 0x04)
-                uint16_t subclass = dev->device_class & 0xFF;
+                // Validate device type
                 if (class_code == 0x06 && subclass == 0x04) {
-                    printf("        ✓ CORRECT: This is a PCI Bridge/Root Port\n");
-                    printf("        ✓ DDIO register should be here!\n");
-                } else if (class_code == 0x08) {
-                    printf("        ✗ WRONG: This is a System Peripheral (IOMMU/VT-d)\n");
-                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
-                    printf("        ✗ This is NOT a PCIe Root Port!\n");
+                    printf("           ✓ This is a PCI Bridge/Root Port\n");
+                    printf("           ✓ DDIO operations should work\n");
                 } else if (class_code == 0x02) {
-                    printf("        ✗ WRONG: This is the NIC itself (Network Controller)\n");
-                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
-                    printf("        ✗ DDIO register is NOT in the NIC!\n");
-                    printf("        ✗ Should search parent bus (0x%02x) instead!\n", dev->bus - 1);
+                    printf("           ✗ CRITICAL: This is the NIC itself!\n");
+                    printf("           ✗ DDIO register is NOT in the NIC!\n");
+                    printf("           ✗ Register writes will FAIL!\n");
+                } else if (class_code == 0x08) {
+                    printf("           ✗ CRITICAL: This is IOMMU/VT-d!\n");
+                    printf("           ✗ DDIO register is NOT here!\n");
+                    printf("           ✗ Register writes will FAIL!\n");
                 } else {
-                    printf("        ✗ WRONG: Unexpected device class 0x%02x/0x%02x\n", class_code, subclass);
-                    printf("        ✗ Expected: Class 0x06 Subclass 0x04 (PCI Bridge/Root Port)\n");
+                    printf("           ✗ WARNING: Unexpected device class 0x%02x/0x%02x\n", class_code, subclass);
+                    printf("           ✗ Expected: Class 0x06 Subclass 0x04\n");
                 }
             }
 
             return dev;
         }
     }
-    printf("\n[ERROR] Could not find device at bus %02x:00.0\n", nic_bus);
+
+    printf("\n[ERROR] Could not find any suitable device for NIC bus 0x%02x\n", nic_bus);
     return NULL;
 }
 
@@ -229,29 +295,365 @@ void print_dev_info(struct pci_dev *dev) {
     printf("========================\n");
 }
 
-/* Define nic_bus and ddio_state */
-DEFINE_bool(enable, false, "Enable or Disable DDIO");
-DEFINE_uint32(nic_bus, 0x3a, "NIC bus number");
+/*
+ * Save current DDIO state to file
+ */
+void save_current_state(uint8_t nic_bus, struct pci_dev *dev, uint32_t reg_val) {
+    FILE *fp = fopen(state_file_path, "w");
+    if (!fp) {
+        printf("[WARNING] Could not save state to file: %s\n", state_file_path);
+        return;
+    }
+
+    time_t now = time(NULL);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    fprintf(fp, "# DDIO State Snapshot\n");
+    fprintf(fp, "timestamp=%s\n", timestamp);
+    fprintf(fp, "nic_bus=0x%02x\n", nic_bus);
+    fprintf(fp, "root_port=%02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+    fprintf(fp, "register_value=0x%08x\n", reg_val);
+    fprintf(fp, "ddio_state=%s\n", (reg_val & 0x80) ? "enabled" : "disabled");
+
+    // Save LLC Ways (MSR 0xc8b)
+    uint32_t llc_ways;
+    if (read_msr_llc_ways(&llc_ways) == 0) {
+        fprintf(fp, "llc_ways=0x%03x\n", llc_ways);
+    }
+
+    fclose(fp);
+
+    // If running as root (via sudo), change file ownership to original user
+    if (getuid() == 0) {
+        const char *sudo_uid = getenv("SUDO_UID");
+        const char *sudo_gid = getenv("SUDO_GID");
+        if (sudo_uid && sudo_gid) {
+            uid_t uid = atoi(sudo_uid);
+            gid_t gid = atoi(sudo_gid);
+            if (chown(state_file_path, uid, gid) == 0) {
+                chmod(state_file_path, 0644);  // rw-r--r--
+            }
+        }
+    }
+
+    printf("[INFO] Current state saved to %s\n", state_file_path);
+}
+
+/*
+ * Load saved DDIO state from file
+ * Returns: 0 on success, -1 on error
+ */
+int load_saved_state(uint8_t *nic_bus, uint32_t *reg_val, uint32_t *llc_ways) {
+    FILE *fp = fopen(state_file_path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    char line[256];
+    int found_nic_bus = 0, found_reg_val = 0;
+    *llc_ways = 0;  // Optional field
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+
+        if (sscanf(line, "nic_bus=0x%hhx", nic_bus) == 1) {
+            found_nic_bus = 1;
+        } else if (sscanf(line, "register_value=0x%x", reg_val) == 1) {
+            found_reg_val = 1;
+        } else if (sscanf(line, "llc_ways=0x%x", llc_ways) == 1) {
+            // Optional: LLC Ways
+        }
+    }
+
+    fclose(fp);
+
+    if (found_nic_bus && found_reg_val) {
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * Display interactive menu
+ */
+void show_menu(int has_saved_state) {
+    printf("\n");
+    printf("╔════════════════════════════════════════════╗\n");
+    printf("║         DDIO Control Menu                  ║\n");
+    printf("╚════════════════════════════════════════════╝\n");
+    printf("\n");
+    if (has_saved_state) {
+        printf("  1. Restore to saved default state\n");
+    } else {
+        printf("  1. Restore to saved default state (no saved state)\n");
+    }
+    printf("  2. Enable DDIO\n");
+    printf("  3. Disable DDIO\n");
+    printf("  4. Set LLC Ways to minimum (0x600 - 2 ways)\n");
+    printf("  5. Set LLC Ways to maximum (0x7ff - 11 ways)\n");
+    printf("  0. Exit\n");
+    printf("\n");
+    printf("Your choice: ");
+    fflush(stdout);
+}
 
 /**
- * Usage: ./ddio_modify --enable=true --nic_bus=0x3a
- * Please
+ * Usage: sudo ./ddio_modify [nic_bus_hex]
+ * Example: sudo ./ddio_modify 0xb3
+ * If no argument provided, uses default 0xb3
  */
 
 int main(int argc, char *argv[]) {
-    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    uint8_t nic_bus = 0xb3;  // default
+
+    // Parse NIC bus from command line if provided
+    if (argc > 1) {
+        sscanf(argv[1], "0x%hhx", &nic_bus);
+    }
 
     init_pci_access();
 
-    struct pci_dev *dev = find_ddio_device(FLAGS_nic_bus, 1);  // verbose mode
-    print_dev_info(dev);
+    printf("\n");
+    printf("════════════════════════════════════════════════════════\n");
+    printf("              DDIO Control Tool\n");
+    printf("════════════════════════════════════════════════════════\n");
 
-    if (FLAGS_enable) {
-        ddio_enable(FLAGS_nic_bus);
-    } else {
-        ddio_disable(FLAGS_nic_bus);
+    // Find PCIe Root Port
+    struct pci_dev *dev = find_ddio_device(nic_bus, 0);
+    if (!dev) {
+        printf("[ERROR] Could not find PCIe Root Port!\n");
+        pci_cleanup(pacc);
+        return 1;
     }
 
-    pci_cleanup(pacc); /* Close everything */
+    printf("Target NIC Bus:  0x%02x\n", nic_bus);
+    printf("PCIe Root Port:  %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+    printf("\n");
+
+    // Check current DDIO state
+    uint32_t current_reg = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+    int current_state = (current_reg & SKX_use_allocating_flow_wr_MASK) ? 1 : 0;
+
+    // Save system default state on first run only
+    uint8_t test_nic_bus;
+    uint32_t test_reg;
+    uint32_t saved_llc_ways;
+    int has_saved_state = (load_saved_state(&test_nic_bus, &test_reg, &saved_llc_ways) == 0);
+    int is_first_run = !has_saved_state;  // Remember if this is first run
+
+    if (!has_saved_state) {
+        // First run: save current state as default
+        save_current_state(nic_bus, dev, current_reg);
+        has_saved_state = 1;
+        test_reg = current_reg;  // Update test_reg for summary
+        printf("[INFO] First run: Current state saved as system default.\n");
+        printf("[INFO] To reset, delete: %s\n", state_file_path);
+    }
+
+    printf("\n");
+    printf("════════════════════════════════════════════════════════\n");
+    printf("                   Status Summary\n");
+    printf("════════════════════════════════════════════════════════\n");
+
+    if (is_first_run) {
+        printf("System Default:  JUST SAVED (0x%08x)\n", current_reg);
+        printf("Current State:   %s (0x%08x)\n",
+               current_state ? "ENABLED " : "DISABLED", current_reg);
+        printf("Status:          ✓ INITIAL STATE\n");
+    } else {
+        int saved_state = (test_reg & SKX_use_allocating_flow_wr_MASK) ? 1 : 0;
+        const char *default_str = saved_state ? "ENABLED " : "DISABLED";
+        const char *current_str = current_state ? "ENABLED " : "DISABLED";
+
+        printf("System Default:  %s (0x%08x)\n", default_str, test_reg);
+        printf("Current State:   %s (0x%08x)\n", current_str, current_reg);
+
+        if (saved_state == current_state) {
+            printf("Status:          ✓ MATCHES default\n");
+        } else {
+            printf("Status:          ⚠ CHANGED from default\n");
+        }
+    }
+
+    // Show LLC Ways allocation (MSR 0xc8b)
+    uint32_t current_llc_ways;
+    if (read_msr_llc_ways(&current_llc_ways) == 0) {
+        int current_bits = __builtin_popcount(current_llc_ways & 0x7ff);
+        printf("────────────────────────────────────────────────────────\n");
+
+        if (is_first_run) {
+            printf("LLC Ways (0xc8b):  0x%03x (%d ways, CPU 0)\n",
+                   current_llc_ways, current_bits);
+            printf("                   ✓ INITIAL STATE\n");
+        } else if (saved_llc_ways > 0) {
+            int saved_bits = __builtin_popcount(saved_llc_ways & 0x7ff);
+            printf("System Default:    0x%03x (%d ways)\n", saved_llc_ways, saved_bits);
+            printf("Current State:     0x%03x (%d ways)\n", current_llc_ways, current_bits);
+
+            if (saved_llc_ways == current_llc_ways) {
+                printf("Status:            ✓ MATCHES default\n");
+            } else {
+                printf("Status:            ⚠ CHANGED from default\n");
+            }
+        } else {
+            // Old state file without LLC Ways
+            printf("LLC Ways (0xc8b):  0x%03x (%d ways, CPU 0)\n",
+                   current_llc_ways, current_bits);
+            printf("                   (no saved default)\n");
+        }
+
+        if (current_llc_ways >= 0x600 && current_llc_ways <= 0x7ff) {
+            printf("                   ✓ Valid range (0x600-0x7ff)\n");
+        } else {
+            printf("                   ⚠ Outside valid range (0x600-0x7ff)\n");
+        }
+    }
+    printf("════════════════════════════════════════════════════════\n");
+
+    // STEP 5: Show menu and get user choice
+    show_menu(has_saved_state);
+
+    int choice;
+    if (scanf("%d", &choice) != 1) {
+        printf("[ERROR] Invalid input\n");
+        pci_cleanup(pacc);
+        return 1;
+    }
+
+    printf("\n");
+    printf("════════════════════════════════════════════════════════\n");
+
+    // Execute user choice
+    switch (choice) {
+        case 1: {  // Restore to saved default
+            printf("[ACTION] Restoring to saved default state...\n\n");
+            uint8_t saved_nic_bus;
+            uint32_t saved_reg;
+            uint32_t saved_llc;
+
+            if (load_saved_state(&saved_nic_bus, &saved_reg, &saved_llc) != 0) {
+                printf("[ERROR] No saved state found in %s\n", state_file_path);
+                printf("        Cannot restore. Exiting...\n");
+                break;
+            }
+
+            int saved_state = (saved_reg & SKX_use_allocating_flow_wr_MASK) ? 1 : 0;
+            printf("[INFO] Saved PCI Register: 0x%08x (%s)\n",
+                   saved_reg, saved_state ? "enabled" : "disabled");
+
+            if (saved_llc > 0) {
+                int saved_bits = __builtin_popcount(saved_llc & 0x7ff);
+                printf("[INFO] Saved LLC Ways:     0x%03x (%d ways)\n",
+                       saved_llc, saved_bits);
+            }
+            printf("\n");
+
+            // Restore PCI Register
+            if (saved_state) {
+                ddio_enable(nic_bus);
+            } else {
+                ddio_disable(nic_bus);
+            }
+
+            // Restore LLC Ways
+            if (saved_llc > 0) {
+                printf("\n[RESTORE] Setting LLC Ways to 0x%03x...\n", saved_llc);
+                if (write_msr_llc_ways(saved_llc) == 0) {
+                    printf("[RESTORE] ✓ LLC Ways restored successfully\n");
+                } else {
+                    printf("[RESTORE] ✗ Failed to restore LLC Ways\n");
+                }
+            }
+
+            // Verify restoration
+            uint32_t new_reg = pci_read_long(dev, SKX_PERFCTRLSTS_0);
+            uint32_t new_llc;
+            int llc_ok = (read_msr_llc_ways(&new_llc) == 0);
+
+            printf("\n[VERIFY] Checking restoration...\n");
+            if (new_reg == saved_reg) {
+                printf("         PCI Register: ✓ MATCH (0x%08x)\n", new_reg);
+            } else {
+                printf("         PCI Register: ✗ MISMATCH\n");
+                printf("           Expected: 0x%08x\n", saved_reg);
+                printf("           Current:  0x%08x\n", new_reg);
+            }
+
+            if (saved_llc > 0 && llc_ok) {
+                if (new_llc == saved_llc) {
+                    printf("         LLC Ways:     ✓ MATCH (0x%03x)\n", new_llc);
+                } else {
+                    printf("         LLC Ways:     ✗ MISMATCH\n");
+                    printf("           Expected: 0x%03x\n", saved_llc);
+                    printf("           Current:  0x%03x\n", new_llc);
+                }
+            }
+
+            if (new_reg == saved_reg && (!saved_llc || new_llc == saved_llc)) {
+                printf("\n[SUCCESS] ✓ Fully restored to saved state!\n");
+            } else {
+                printf("\n[WARNING] ⚠ Partial restoration\n");
+            }
+            break;
+        }
+
+        case 2:  // Enable DDIO
+            printf("[ACTION] Enabling DDIO...\n\n");
+            ddio_enable(nic_bus);
+            break;
+
+        case 3:  // Disable DDIO
+            printf("[ACTION] Disabling DDIO...\n\n");
+            ddio_disable(nic_bus);
+            break;
+
+        case 4: {  // Set LLC Ways to minimum
+            printf("[ACTION] Setting LLC Ways to minimum (0x600)...\n\n");
+            if (write_msr_llc_ways(0x600) == 0) {
+                printf("[SUCCESS] ✓ LLC Ways set to 0x600 (2 ways)\n");
+
+                // Verify
+                uint32_t verify_llc;
+                if (read_msr_llc_ways(&verify_llc) == 0) {
+                    printf("[VERIFY] Current LLC Ways: 0x%03x (%d ways)\n",
+                           verify_llc, __builtin_popcount(verify_llc & 0x7ff));
+                }
+            } else {
+                printf("[ERROR] ✗ Failed to set LLC Ways\n");
+            }
+            break;
+        }
+
+        case 5: {  // Set LLC Ways to maximum
+            printf("[ACTION] Setting LLC Ways to maximum (0x7ff)...\n\n");
+            if (write_msr_llc_ways(0x7ff) == 0) {
+                printf("[SUCCESS] ✓ LLC Ways set to 0x7ff (11 ways)\n");
+
+                // Verify
+                uint32_t verify_llc;
+                if (read_msr_llc_ways(&verify_llc) == 0) {
+                    printf("[VERIFY] Current LLC Ways: 0x%03x (%d ways)\n",
+                           verify_llc, __builtin_popcount(verify_llc & 0x7ff));
+                }
+            } else {
+                printf("[ERROR] ✗ Failed to set LLC Ways\n");
+            }
+            break;
+        }
+
+        case 0:  // Exit
+            printf("[INFO] Exiting without changes.\n");
+            break;
+
+        default:
+            printf("[ERROR] Invalid choice: %d\n", choice);
+            break;
+    }
+
+    printf("════════════════════════════════════════════════════════\n");
+    printf("\n");
+
+    pci_cleanup(pacc);
     return 0;
 }
