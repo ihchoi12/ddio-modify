@@ -24,6 +24,14 @@ extern "C" {
 #define SKX_use_allocating_flow_wr_MASK 0x80
 #define SKX_nosnoopopwren_MASK 0x8
 
+// CPU generation detection
+enum CpuGeneration {
+    CPU_GEN_UNKNOWN = 0,
+    CPU_GEN_SKYLAKE_SP,      // Skylake-SP (1st/2nd Gen Xeon Scalable) - DDIO register writable
+    CPU_GEN_ICELAKE_SP,      // Ice Lake-SP (3rd Gen Xeon Scalable) - DDIO register locked
+    CPU_GEN_SAPPHIRE_RAPIDS  // Sapphire Rapids (4th Gen) - DDIO register locked
+};
+
 /*
  * Find the proper pci device (i.e., PCIe Root Port) based on the nic device
  * For instance, if the NIC is located on 0000:3a:00.0 (i.e., BDF)
@@ -36,6 +44,49 @@ struct pci_access *pacc;
 
 // State file stored in /tmp (works across NFS mounts and different machines)
 const char *state_file_path = "/tmp/.ddio_state.dat";
+
+/*
+ * Detect CPU generation from /proc/cpuinfo
+ * Ice Lake-SP and newer have DDIO register locked by BIOS
+ */
+CpuGeneration detect_cpu_generation() {
+    FILE *fp = fopen("/proc/cpuinfo", "r");
+    if (!fp) return CPU_GEN_UNKNOWN;
+
+    char line[256];
+    int family = 0, model = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "cpu family", 10) == 0) {
+            sscanf(line, "cpu family : %d", &family);
+        } else if (strncmp(line, "model", 5) == 0 && line[5] == '\t') {
+            sscanf(line, "model : %d", &model);
+            break;  // Got both values
+        }
+    }
+    fclose(fp);
+
+    // Intel Family 6:
+    // Skylake-SP/Cascade Lake-SP: model 85 (0x55)
+    // Ice Lake-SP: model 106 (0x6A)
+    // Sapphire Rapids: model 143 (0x8F)
+    if (family == 6) {
+        if (model == 85) return CPU_GEN_SKYLAKE_SP;
+        if (model == 106) return CPU_GEN_ICELAKE_SP;
+        if (model == 143) return CPU_GEN_SAPPHIRE_RAPIDS;
+    }
+
+    return CPU_GEN_UNKNOWN;
+}
+
+const char* get_cpu_gen_name(CpuGeneration gen) {
+    switch (gen) {
+        case CPU_GEN_SKYLAKE_SP: return "Skylake-SP/Cascade Lake-SP";
+        case CPU_GEN_ICELAKE_SP: return "Ice Lake-SP";
+        case CPU_GEN_SAPPHIRE_RAPIDS: return "Sapphire Rapids";
+        default: return "Unknown";
+    }
+}
 
 void init_pci_access(void) {
     pacc = pci_alloc(); /* Get the pci_access structure */
@@ -74,6 +125,46 @@ int write_msr_llc_ways(uint32_t value) {
     snprintf(cmd, sizeof(cmd), "wrmsr -a 0xc8b 0x%x 2>/dev/null", value);
     int ret = system(cmd);
     return (ret == 0) ? 0 : -1;
+}
+
+/*
+ * Detect number of LLC (L3) ways from sysfs
+ * Returns: number of ways, or 11 as default if detection fails
+ */
+int detect_llc_ways() {
+    FILE *fp = fopen("/sys/devices/system/cpu/cpu0/cache/index3/ways_of_associativity", "r");
+    if (!fp) {
+        return 11;  // Default fallback
+    }
+
+    int ways = 11;
+    if (fscanf(fp, "%d", &ways) != 1) {
+        ways = 11;
+    }
+    fclose(fp);
+    return ways;
+}
+
+/*
+ * Get valid LLC ways range for this system
+ * min_val: minimum value (2 ways enabled - bits for ways-1 and ways-2)
+ * max_val: maximum value (all ways enabled)
+ */
+void get_llc_ways_range(int total_ways, uint32_t *min_val, uint32_t *max_val) {
+    // Maximum: all ways enabled (e.g., 11 ways = 0x7ff, 12 ways = 0xfff)
+    *max_val = (1U << total_ways) - 1;
+
+    // Minimum: only 2 ways enabled (top 2 bits)
+    // For 11 ways: 0x600 (bits 9,10), for 12 ways: 0xc00 (bits 10,11)
+    *min_val = (0x3U << (total_ways - 2));
+}
+
+/*
+ * Count number of set bits in LLC ways value
+ */
+int count_llc_ways_bits(uint32_t value, int total_ways) {
+    uint32_t mask = (1U << total_ways) - 1;
+    return __builtin_popcount(value & mask);
 }
 
 static int search_count = 0;
@@ -377,7 +468,7 @@ int load_saved_state(uint8_t *nic_bus, uint32_t *reg_val, uint32_t *llc_ways) {
 /*
  * Display interactive menu
  */
-void show_menu(int has_saved_state) {
+void show_menu(int has_saved_state, int total_llc_ways, uint32_t min_llc, uint32_t max_llc, int ddio_locked) {
     printf("\n");
     printf("╔════════════════════════════════════════════╗\n");
     printf("║         DDIO Control Menu                  ║\n");
@@ -388,10 +479,15 @@ void show_menu(int has_saved_state) {
     } else {
         printf("  1. Restore to saved default state (no saved state)\n");
     }
-    printf("  2. Enable DDIO\n");
-    printf("  3. Disable DDIO\n");
-    printf("  4. Set LLC Ways to minimum (0x600 - 2 ways)\n");
-    printf("  5. Set LLC Ways to maximum (0x7ff - 11 ways)\n");
+    if (ddio_locked) {
+        printf("  2. Enable DDIO  [LOCKED - use BIOS]\n");
+        printf("  3. Disable DDIO [LOCKED - use BIOS]\n");
+    } else {
+        printf("  2. Enable DDIO\n");
+        printf("  3. Disable DDIO\n");
+    }
+    printf("  4. Set LLC Ways (valid: 0x%03x-0x%03x, %d-%d ways)\n",
+           min_llc, max_llc, 2, total_llc_ways);
     printf("  0. Exit\n");
     printf("\n");
     printf("Your choice: ");
@@ -429,6 +525,34 @@ int main(int argc, char *argv[]) {
 
     printf("Target NIC Bus:  0x%02x\n", nic_bus);
     printf("PCIe Root Port:  %02x:%02x.%x\n", dev->bus, dev->dev, dev->func);
+
+    // Detect CPU generation
+    CpuGeneration cpu_gen = detect_cpu_generation();
+    printf("CPU Generation:  %s\n", get_cpu_gen_name(cpu_gen));
+
+    // Warn about DDIO register lock on newer CPUs
+    int ddio_register_locked = 0;
+    if (cpu_gen == CPU_GEN_ICELAKE_SP || cpu_gen == CPU_GEN_SAPPHIRE_RAPIDS) {
+        ddio_register_locked = 1;
+        printf("\n");
+        printf("════════════════════════════════════════════════════════\n");
+        printf("⚠  WARNING: DDIO REGISTER LOCKED ON THIS CPU\n");
+        printf("════════════════════════════════════════════════════════\n");
+        printf("On %s, the DDIO enable/disable register (0x180) is\n", get_cpu_gen_name(cpu_gen));
+        printf("locked by BIOS and cannot be modified at runtime.\n");
+        printf("\n");
+        printf("Options:\n");
+        printf("  • Check BIOS for 'DDIO' or 'Data Direct I/O' setting\n");
+        printf("  • LLC Ways (MSR 0xc8b) can still be modified\n");
+        printf("════════════════════════════════════════════════════════\n");
+    }
+
+    // Detect LLC ways for this system
+    int total_llc_ways = detect_llc_ways();
+    uint32_t min_llc_val, max_llc_val;
+    get_llc_ways_range(total_llc_ways, &min_llc_val, &max_llc_val);
+    printf("System LLC Ways: %d (valid range: 0x%03x-0x%03x)\n",
+           total_llc_ways, min_llc_val, max_llc_val);
     printf("\n");
 
     // Check current DDIO state
@@ -456,7 +580,14 @@ int main(int argc, char *argv[]) {
     printf("                   Status Summary\n");
     printf("════════════════════════════════════════════════════════\n");
 
-    if (is_first_run) {
+    if (ddio_register_locked) {
+        // On Ice Lake-SP+, register 0x180 doesn't reliably indicate DDIO status
+        printf("Register 0x180:  0x%08x (bit 7 = %d)\n", current_reg, current_state);
+        printf("⚠  NOTE: On %s, this register does NOT indicate\n", get_cpu_gen_name(cpu_gen));
+        printf("   actual DDIO status. DDIO is likely ENABLED by BIOS.\n");
+        printf("   Check 'dmesg | grep dca' - if DCA service is running,\n");
+        printf("   DDIO is enabled. PCM miss rate confirms DDIO status.\n");
+    } else if (is_first_run) {
         printf("System Default:  JUST SAVED (0x%08x)\n", current_reg);
         printf("Current State:   %s (0x%08x)\n",
                current_state ? "ENABLED " : "DISABLED", current_reg);
@@ -479,7 +610,7 @@ int main(int argc, char *argv[]) {
     // Show LLC Ways allocation (MSR 0xc8b)
     uint32_t current_llc_ways;
     if (read_msr_llc_ways(&current_llc_ways) == 0) {
-        int current_bits = __builtin_popcount(current_llc_ways & 0x7ff);
+        int current_bits = count_llc_ways_bits(current_llc_ways, total_llc_ways);
         printf("────────────────────────────────────────────────────────\n");
 
         if (is_first_run) {
@@ -487,7 +618,7 @@ int main(int argc, char *argv[]) {
                    current_llc_ways, current_bits);
             printf("                   ✓ INITIAL STATE\n");
         } else if (saved_llc_ways > 0) {
-            int saved_bits = __builtin_popcount(saved_llc_ways & 0x7ff);
+            int saved_bits = count_llc_ways_bits(saved_llc_ways, total_llc_ways);
             printf("System Default:    0x%03x (%d ways)\n", saved_llc_ways, saved_bits);
             printf("Current State:     0x%03x (%d ways)\n", current_llc_ways, current_bits);
 
@@ -503,16 +634,19 @@ int main(int argc, char *argv[]) {
             printf("                   (no saved default)\n");
         }
 
-        if (current_llc_ways >= 0x600 && current_llc_ways <= 0x7ff) {
-            printf("                   ✓ Valid range (0x600-0x7ff)\n");
+        if (current_llc_ways >= min_llc_val && current_llc_ways <= max_llc_val) {
+            printf("Valid Range:       0x%03x-0x%03x (%d-%d ways) ✓\n",
+                   min_llc_val, max_llc_val, 2, total_llc_ways);
         } else {
-            printf("                   ⚠ Outside valid range (0x600-0x7ff)\n");
+            printf("Valid Range:       0x%03x-0x%03x (%d-%d ways)\n",
+                   min_llc_val, max_llc_val, 2, total_llc_ways);
+            printf("                   ⚠ Current value outside valid range\n");
         }
     }
     printf("════════════════════════════════════════════════════════\n");
 
     // STEP 5: Show menu and get user choice
-    show_menu(has_saved_state);
+    show_menu(has_saved_state, total_llc_ways, min_llc_val, max_llc_val, ddio_register_locked);
 
     int choice;
     if (scanf("%d", &choice) != 1) {
@@ -543,7 +677,7 @@ int main(int argc, char *argv[]) {
                    saved_reg, saved_state ? "enabled" : "disabled");
 
             if (saved_llc > 0) {
-                int saved_bits = __builtin_popcount(saved_llc & 0x7ff);
+                int saved_bits = count_llc_ways_bits(saved_llc, total_llc_ways);
                 printf("[INFO] Saved LLC Ways:     0x%03x (%d ways)\n",
                        saved_llc, saved_bits);
             }
@@ -600,41 +734,56 @@ int main(int argc, char *argv[]) {
 
         case 2:  // Enable DDIO
             printf("[ACTION] Enabling DDIO...\n\n");
+            if (ddio_register_locked) {
+                printf("⚠  WARNING: DDIO register is LOCKED on this CPU!\n");
+                printf("   This operation will likely fail.\n");
+                printf("   To change DDIO state, use BIOS settings.\n\n");
+            }
             ddio_enable(nic_bus);
             break;
 
         case 3:  // Disable DDIO
             printf("[ACTION] Disabling DDIO...\n\n");
+            if (ddio_register_locked) {
+                printf("⚠  WARNING: DDIO register is LOCKED on this CPU!\n");
+                printf("   This operation will likely fail.\n");
+                printf("   To change DDIO state, use BIOS settings.\n\n");
+            }
             ddio_disable(nic_bus);
             break;
 
-        case 4: {  // Set LLC Ways to minimum
-            printf("[ACTION] Setting LLC Ways to minimum (0x600)...\n\n");
-            if (write_msr_llc_ways(0x600) == 0) {
-                printf("[SUCCESS] ✓ LLC Ways set to 0x600 (2 ways)\n");
+        case 4: {  // Set LLC Ways with user input
+            printf("[ACTION] Set LLC Ways\n\n");
+            printf("Valid range: 0x%03x - 0x%03x (%d - %d ways)\n",
+                   min_llc_val, max_llc_val, 2, total_llc_ways);
+            printf("\n");
+            printf("Enter value (hex, e.g., 0x%03x): ", max_llc_val);
+            fflush(stdout);
 
-                // Verify
-                uint32_t verify_llc;
-                if (read_msr_llc_ways(&verify_llc) == 0) {
-                    printf("[VERIFY] Current LLC Ways: 0x%03x (%d ways)\n",
-                           verify_llc, __builtin_popcount(verify_llc & 0x7ff));
-                }
-            } else {
-                printf("[ERROR] ✗ Failed to set LLC Ways\n");
+            uint32_t new_llc_val;
+            if (scanf("%x", &new_llc_val) != 1) {
+                printf("[ERROR] ✗ Invalid input\n");
+                break;
             }
-            break;
-        }
 
-        case 5: {  // Set LLC Ways to maximum
-            printf("[ACTION] Setting LLC Ways to maximum (0x7ff)...\n\n");
-            if (write_msr_llc_ways(0x7ff) == 0) {
-                printf("[SUCCESS] ✓ LLC Ways set to 0x7ff (11 ways)\n");
+            // Validate range
+            if (new_llc_val < min_llc_val || new_llc_val > max_llc_val) {
+                printf("[ERROR] ✗ Value 0x%03x is outside valid range (0x%03x-0x%03x)\n",
+                       new_llc_val, min_llc_val, max_llc_val);
+                break;
+            }
+
+            int new_bits = count_llc_ways_bits(new_llc_val, total_llc_ways);
+            printf("\n[ACTION] Setting LLC Ways to 0x%03x (%d ways)...\n\n", new_llc_val, new_bits);
+
+            if (write_msr_llc_ways(new_llc_val) == 0) {
+                printf("[SUCCESS] ✓ LLC Ways set to 0x%03x (%d ways)\n", new_llc_val, new_bits);
 
                 // Verify
                 uint32_t verify_llc;
                 if (read_msr_llc_ways(&verify_llc) == 0) {
-                    printf("[VERIFY] Current LLC Ways: 0x%03x (%d ways)\n",
-                           verify_llc, __builtin_popcount(verify_llc & 0x7ff));
+                    int verify_bits = count_llc_ways_bits(verify_llc, total_llc_ways);
+                    printf("[VERIFY] Current LLC Ways: 0x%03x (%d ways)\n", verify_llc, verify_bits);
                 }
             } else {
                 printf("[ERROR] ✗ Failed to set LLC Ways\n");
